@@ -77,7 +77,9 @@ public:
     // ------------------------------------------------------------------
 
     /**
-     * Return the cached timestamp in nanoseconds since the UNIX epoch.
+     * Return the cached CLOCK_MONOTONIC timestamp in nanoseconds.
+     * Accuracy is the refresh interval (1 ms): fine for coarse timestamps,
+     * NOT for per-message latency. Use mds::precise_now_ns() for that.
      * This is the hot-path function — it performs a single atomic load
      * with relaxed ordering and no system calls.
      *
@@ -100,9 +102,11 @@ private:
     // Implementation
     // ------------------------------------------------------------------
 
-    /// Read the platform high-resolution clock and return nanoseconds.
+    /// Read CLOCK_MONOTONIC (steady_clock) and return nanoseconds.
+    /// high_resolution_clock is an alias of system_clock on libstdc++, which
+    /// can jump when NTP adjusts the wall clock, so it is not used here.
     static int64_t sample_clock() noexcept {
-        using Clock = std::chrono::high_resolution_clock;
+        using Clock = std::chrono::steady_clock;
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    Clock::now().time_since_epoch())
             .count();

@@ -5,10 +5,15 @@
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch_all.hpp>
+using Catch::Approx;  // Catch2 v3 moved Approx into the Catch namespace
 #include "core/tick_data.hpp"
 #include "core/spsc_queue.hpp"
 #include "core/monotonic_clock.hpp"
 #include "util/cpu_affinity.hpp"
+#include "util/latency_recorder.hpp"
+#include "transport/shm_transport.hpp"
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -222,4 +227,47 @@ TEST_CASE("MemAlign: is_aligned correctness", "[util]") {
 TEST_CASE("MemAlign: type alignment for core types", "[util]") {
     REQUIRE(mds::MemAlign::type_is_aligned<mds::TickData>(64));
     REQUIRE(mds::MemAlign::type_is_aligned<mds::SpscQueue>(64));
+}
+
+
+// ===========================================================================
+// Regression: consumer attached through ShmTransport must be able to pop().
+// Before the fix the consumer mapped the segment PROT_READ and the first
+// successful pop() (which writes read_idx_) raised SIGSEGV.
+// ===========================================================================
+TEST_CASE("ShmTransport: attached consumer can pop", "[shm]") {
+    const std::string name = "mds_test_" + std::to_string(::getpid());
+    mds::ShmTransport producer(name, sizeof(mds::SpscQueue), /*create=*/true);
+    auto* q = new (producer.ptr<void>()) mds::SpscQueue{};
+
+    mds::ShmTransport consumer(name, sizeof(mds::SpscQueue), /*create=*/false);
+    auto* cq = consumer.ptr<mds::SpscQueue>();
+
+    mds::TickData in("TEST", 1.0, 2.0, 42);
+    REQUIRE(q->push(in));
+    mds::TickData out;
+    REQUIRE(cq->pop(out));
+    REQUIRE(out.timestamp_ns == 42);
+    REQUIRE(q->empty());
+}
+
+TEST_CASE("LatencyRecorder: nearest-rank percentiles, warm-up ignored", "[latency]") {
+    mds::LatencyRecorder rec(1000, 10);
+    for (int i = 0; i < 10; ++i) rec.record(1000000);   // warm-up outliers
+    for (int i = 1; i <= 1000; ++i) rec.record(i);
+    const auto s = rec.summary();
+    REQUIRE(s.n == 1000);
+    REQUIRE(s.min == 1);
+    REQUIRE(s.max == 1000);
+    REQUIRE(s.p50 == 501);
+    REQUIRE(s.p99 == 991);
+}
+
+TEST_CASE("precise_now_ns: monotonic across calls", "[clock]") {
+    int64_t prev = mds::precise_now_ns();
+    for (int i = 0; i < 100000; ++i) {
+        const int64_t now = mds::precise_now_ns();
+        REQUIRE(now >= prev);
+        prev = now;
+    }
 }

@@ -29,6 +29,7 @@
 #include "core/monotonic_clock.hpp"
 #include "transport/shm_transport.hpp"
 #include "util/cpu_affinity.hpp"
+#include "util/latency_recorder.hpp"
 
 #include <boost/asio.hpp>
 #include <fmt/core.h>
@@ -156,7 +157,12 @@ static const std::vector<const char*> SYMBOLS = {
 // main
 // ===========================================================================
 
-int main() {
+int main(int argc, char** argv) {
+    // Usage: publisher [ticks=1000] [interval_us=1000] [startup_delay_ms=0]
+    const auto ticks            = static_cast<std::size_t>(mds::arg_or(argc, argv, 1, 1000));
+    const auto interval_us      = mds::arg_or(argc, argv, 2, 1000);
+    const auto startup_delay_ms = mds::arg_or(argc, argv, 3, 0);
+
     fmt::print("=============================================\n");
     fmt::print("   Market Data Publisher  (Process A)\n");
     fmt::print("=============================================\n\n");
@@ -208,9 +214,13 @@ int main() {
         // -------------------------------------------------------------------
         // 4. Clock
         // -------------------------------------------------------------------
-        mds::MonotonicClock clk;
-        fmt::print("[CLK] MonotonicClock started (refresh: {} ms)\n",
-                   mds::MonotonicClock::REFRESH_INTERVAL_MS);
+        // Each tick is stamped with CLOCK_MONOTONIC right before push().
+        // (The cached MonotonicClock is only 1 ms accurate; see latency_recorder.hpp.)
+        fmt::print("[CLK] Tick timestamps: steady_clock (CLOCK_MONOTONIC)\n");
+        if (startup_delay_ms > 0) {
+            fmt::print("[PUB] Waiting {} ms for subscribers to attach...\n", startup_delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(startup_delay_ms));
+        }
 
         // -------------------------------------------------------------------
         // 5. Tick-generation loop
@@ -225,13 +235,13 @@ int main() {
 
         std::size_t published = 0;
         std::size_t dropped   = 0;
+        std::size_t dropped_reported_at = 0;
 
         while (true) {
             const char*   sym    = SYMBOLS[sym_dist(rng)];
             const double  bid    = price_dist(rng);
             const double  ask    = bid + spread_dist(rng);
-            const int64_t ts     = clk.now_ns();
-            mds::TickData tick(sym, bid, ask, ts);
+            mds::TickData tick(sym, bid, ask, 0);
 
             // Prefetch the next write slot to warm the cache line.
             {
@@ -240,6 +250,7 @@ int main() {
                 mds::MemAlign::prefetch_write(&queue->data()[next_w]);
             }
 
+            tick.timestamp_ns = mds::precise_now_ns();
             if (queue->push(tick)) {
                 ++published;
                 if (broadcaster.client_count() > 0) {
@@ -249,7 +260,8 @@ int main() {
                 ++dropped;
             }
 
-            if (published % 100 == 0 && published > 0) {
+            if (published % 5000 == 0 && published > 0 && dropped_reported_at != published) {
+                dropped_reported_at = published;
                 fmt::print(
                     "[PUB] published={:6}  queued={:4}/{}  dropped={}  tcp_clients={}\n",
                     published,
@@ -258,10 +270,9 @@ int main() {
                     broadcaster.client_count());
             }
 
-            // ~1 000 ticks/s
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
 
-            if (published >= 1000) {
+            if (published + dropped >= ticks) {  // attempts, so a stalled consumer can't hang us
                 fmt::print("\n[PUB] Reached {} published ticks — stopping.\n", published);
                 break;
             }
@@ -270,6 +281,8 @@ int main() {
         // -------------------------------------------------------------------
         // 6. Shutdown
         // -------------------------------------------------------------------
+        // Let TCP subscribers drain the last messages before closing sockets.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         fmt::print("[NET] Stopping IO context...\n");
         io.stop();
         if (io_thread.joinable()) io_thread.join();
