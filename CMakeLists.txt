@@ -84,6 +84,7 @@ target_link_libraries(shm_subscriber
     PRIVATE 
         Threads::Threads 
         fmt::fmt 
+        nlohmann_json::nlohmann_json   # tick_data.hpp includes nlohmann/json.hpp
 )
 if(NOT APPLE)
     target_link_libraries(shm_subscriber PRIVATE rt)
@@ -109,7 +110,12 @@ target_link_libraries(test_tick_data
     PRIVATE 
         Catch2::Catch2WithMain
         nlohmann_json::nlohmann_json
+        fmt::fmt
+        Threads::Threads
 )
+if(NOT APPLE)
+    target_link_libraries(test_tick_data PRIVATE rt)
+endif()
 
 add_test(NAME CoreTests COMMAND test_tick_data)
 

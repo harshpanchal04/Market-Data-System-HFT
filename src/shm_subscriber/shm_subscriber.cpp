@@ -2,82 +2,66 @@
  * @file shm_subscriber.cpp
  * @brief Shared-Memory Subscriber — Process B
  *
- * Attaches (read-only) to the POSIX shared-memory segment created by the
- * publisher and continuously polls the SpscQueue for new ticks. This is the
- * ultra-low-latency path: no kernel boundary is crossed per message, no data
- * is copied between address spaces — both processes simply see the same
- * physical memory pages.
+ * Attaches to the POSIX shared-memory segment created by the publisher and
+ * busy-polls the SpscQueue for new ticks. This is the low-latency path: no
+ * kernel boundary is crossed per message and no data is copied between
+ * address spaces. Both processes see the same physical pages.
+ *
+ * Usage:  shm_subscriber [count=1000] [warmup=0]
+ *   count   stop after this many messages
+ *   warmup  ignore this many initial samples (ticks that queued up before
+ *           this process attached would otherwise inflate the tail)
+ *
+ * Mapping
+ * -------
+ * The consumer maps the segment read-write. pop() advances read_idx_, which
+ * lives in the shared segment, so a read-only mapping would fault on the
+ * first successful pop.
  *
  * Latency measurement
  * -------------------
- * The publisher embeds a MonotonicClock timestamp (nanoseconds) in each tick.
- * The subscriber reads its own MonotonicClock on arrival and computes the
- * difference. Both clocks are seeded from the same high_resolution_clock
- * source, so the delta primarily reflects queue-traversal time plus any
- * OS scheduler jitter.
+ * The publisher stamps each tick with CLOCK_MONOTONIC (precise_now_ns) right
+ * before push(). The subscriber reads the same clock right after pop(). The
+ * difference is the queue traversal time plus cache-line transfer between
+ * cores plus any scheduler interference.
  *
  * Spin-wait policy
  * ----------------
- * The consumer spins on pop() with no synchronisation overhead. After 1 000
- * consecutive empty polls it yields for 1 μs to reduce CPU saturation when
- * the publisher is idle. After 10 000 consecutive empty polls the yield
- * counter is clamped to avoid integer overflow.
+ * The consumer never sleeps: it spins on pop() with a cpu_relax() hint.
+ * Sleeping after N empty polls (the original design) adds the OS wake-up
+ * delay, typically 50+ microseconds, to every message that arrives while
+ * the consumer is asleep.
  */
 
 #include "core/tick_data.hpp"
 #include "core/spsc_queue.hpp"
-#include "core/monotonic_clock.hpp"
 #include "transport/shm_transport.hpp"
+#include "util/cpu_affinity.hpp"
+#include "util/latency_recorder.hpp"
 
 #include <fmt/core.h>
-#include <fmt/chrono.h>
 
-#include <algorithm>
-#include <chrono>
-#include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <thread>
 
-// ===========================================================================
-// LatencyStats — running statistics accumulator
-// ===========================================================================
+int main(int argc, char** argv) {
+    const auto count  = static_cast<std::size_t>(mds::arg_or(argc, argv, 1, 1000));
+    const auto warmup = static_cast<std::size_t>(mds::arg_or(argc, argv, 2, 0));
 
-struct LatencyStats {
-    std::size_t count     = 0;
-    int64_t     total_ns  = 0;
-    int64_t     min_ns    = INT64_MAX;
-    int64_t     max_ns    = 0;
-
-    void update(int64_t latency_ns) noexcept {
-        ++count;
-        total_ns += latency_ns;
-        min_ns    = std::min(min_ns, latency_ns);
-        max_ns    = std::max(max_ns, latency_ns);
-    }
-
-    void print_summary() const {
-        if (count == 0) { fmt::print("  (no data)\n"); return; }
-        double avg = (static_cast<double>(total_ns) / count) / 1e3;
-        double mn  = min_ns / 1e3;
-        double mx  = max_ns / 1e3;
-        fmt::print("  samples={:6}  avg={:.3f}µs  min={:.3f}µs  max={:.3f}µs\n",
-                   count, avg, mn, mx);
-    }
-};
-
-// ===========================================================================
-// main
-// ===========================================================================
-
-int main() {
     fmt::print("=============================================\n");
     fmt::print("   Shared-Memory Subscriber  (Process B)\n");
     fmt::print("=============================================\n\n");
 
     try {
         // -------------------------------------------------------------------
-        // 1. Attach to shared memory (read-only)
+        // 1. Pin away from the publisher (core 0) when there is a spare core
+        // -------------------------------------------------------------------
+        if (mds::CpuPin::logical_cpu_count() > 1 && mds::CpuPin::bind(1)) {
+            fmt::print("[SYS] Subscriber pinned to CPU core 1\n");
+        }
+
+        // -------------------------------------------------------------------
+        // 2. Attach to shared memory (read-write: pop() writes read_idx_)
         // -------------------------------------------------------------------
         fmt::print("[SHM] Attaching to segment 'mds_ticks'...\n");
         mds::ShmTransport shm("mds_ticks", sizeof(mds::SpscQueue), /*create=*/false);
@@ -87,78 +71,39 @@ int main() {
         }
         fmt::print("[SHM] Attached ({} bytes)\n", shm.size());
 
-        const mds::SpscQueue* queue = shm.ptr<mds::SpscQueue>();
+        mds::SpscQueue* queue = shm.ptr<mds::SpscQueue>();
 
         // -------------------------------------------------------------------
-        // 2. Local clock for latency measurement
+        // 3. Busy-poll loop
         // -------------------------------------------------------------------
-        mds::MonotonicClock clk;
-        fmt::print("[CLK] MonotonicClock started\n");
+        fmt::print("[SUB] Polling for {} messages (warm-up {}).\n\n", count, warmup);
 
-        // -------------------------------------------------------------------
-        // 3. Polling loop
-        // -------------------------------------------------------------------
-        fmt::print("\n[SUB] Polling shared-memory queue. Press Ctrl+C to stop.\n\n");
+        mds::LatencyRecorder rec(count, warmup);
+        std::size_t          consumed = 0;
 
-        std::size_t  consumed   = 0;
-        std::size_t  idle_polls = 0;
-        LatencyStats stats;
-
-        while (true) {
+        while (consumed < count) {
             mds::TickData tick;
-
-            // const_cast: the SpscQueue consumer path mutates only read_idx_
-            // which is the consumer's own cache line — safe even with the
-            // shared-memory read-only mmap for the *data* pages.
-            //
-            // Note: in a production system the consumer would have its own
-            // writable mapping of the same SHM segment for the index slot.
-            if (const_cast<mds::SpscQueue*>(queue)->pop(tick)) {
-                const int64_t recv_ns    = clk.now_ns();
-                const int64_t latency_ns = recv_ns - tick.timestamp_ns;
-
-                stats.update(latency_ns);
-                ++consumed;
-                idle_polls = 0;
-
-                // Print first 10 ticks and then every 100th.
-                if (consumed <= 10 || consumed % 100 == 0) {
-                    fmt::print(
-                        "[MSG #{:6}] {:12s}  bid={:8.2f}  ask={:8.2f}  "
-                        "latency={:.3f}µs\n",
-                        consumed,
-                        tick.symbol,
-                        tick.bid_price,
-                        tick.ask_price,
-                        latency_ns / 1e3);
-                }
-
-                // Print statistics every 100 messages.
-                if (consumed % 100 == 0) {
-                    fmt::print("--- Latency stats after {} messages ---\n", consumed);
-                    stats.print_summary();
-                    fmt::print("\n");
-                }
-
-            } else {
-                ++idle_polls;
-                if (idle_polls > 1000) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(1));
-                    if (idle_polls > 10000) idle_polls = 1000; // clamp
-                }
+            if (!queue->pop(tick)) {
+                mds::cpu_relax();
+                continue;
             }
+            const int64_t latency_ns = mds::precise_now_ns() - tick.timestamp_ns;
+            rec.record(latency_ns);
+            ++consumed;
 
-            if (consumed >= 1000) {
-                fmt::print("\n[SUB] Consumed {} ticks — stopping.\n\n", consumed);
-                break;
+            // Printing is slow; keep it off the hot path except for a sample.
+            if (consumed <= 5 || consumed % 5000 == 0) {
+                fmt::print("[MSG #{:6}] {:12s}  bid={:8.2f}  ask={:8.2f}  latency={:.3f}us\n",
+                           consumed, tick.symbol, tick.bid_price, tick.ask_price,
+                           latency_ns / 1e3);
             }
         }
 
         // -------------------------------------------------------------------
         // 4. Final report
         // -------------------------------------------------------------------
-        fmt::print("=== Final Shared-Memory Latency Report ===\n");
-        stats.print_summary();
+        fmt::print("\n=== Final Shared-Memory Latency Report ===\n");
+        rec.report("shm");
         fmt::print("==========================================\n");
 
     } catch (const std::exception& e) {

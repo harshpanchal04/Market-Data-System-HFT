@@ -33,8 +33,10 @@ namespace mds {
  *  - **Creator** (`create = true`): calls shm_open(O_CREAT|O_RDWR), sizes the
  *    segment with ftruncate, then maps it PROT_READ|PROT_WRITE.
  *    Calls shm_unlink on destruction to remove the name from the VFS.
- *  - **Consumer** (`create = false`): opens an existing segment O_RDONLY and
- *    maps it PROT_READ. Does *not* unlink on destruction.
+ *  - **Consumer** (`create = false`): opens an existing segment O_RDWR and
+ *    maps it PROT_READ|PROT_WRITE. The SPSC consumer must write read_idx_,
+ *    which lives in the segment, so a read-only mapping faults on the first
+ *    pop(). Does *not* unlink on destruction.
  *
  * Example (creator):
  * @code
@@ -62,7 +64,7 @@ public:
         if (name.empty())  throw std::runtime_error("ShmTransport: segment name is empty");
         if (size == 0)     throw std::runtime_error("ShmTransport: segment size is zero");
 
-        int oflag = create ? (O_CREAT | O_RDWR) : O_RDONLY;
+        int oflag = create ? (O_CREAT | O_RDWR) : O_RDWR;
         fd_       = ::shm_open(name_.c_str(), oflag, 0666);
         if (fd_ == -1) {
             throw std::runtime_error("ShmTransport: shm_open failed for '" + name_ + "'");
@@ -85,7 +87,7 @@ public:
             }
         }
 
-        int prot   = create ? (PROT_READ | PROT_WRITE) : PROT_READ;
+        int prot   = PROT_READ | PROT_WRITE; // both roles write their own index
         addr_      = ::mmap(nullptr, size_, prot, MAP_SHARED, fd_, 0);
         if (addr_ == MAP_FAILED) {
             ::close(fd_);
